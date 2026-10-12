@@ -1,0 +1,18 @@
+--- a/src/main.jsx
++++ b/src/main.jsx
+@@ -4,6 +4,15 @@
+ import { router } from './router.jsx';
+ import './styles/global.css';
+ 
++// Avinash's chat widget (the one-line embed). Loaded only when the platform sets the
++// widget address, so the site still runs on its own without it.
++const chatWidget = import.meta.env.VITE_CHAT_WIDGET_URL;
++if (chatWidget) {
++  const s = Object.assign(document.createElement('script'), { src: chatWidget, defer: true });
++  s.dataset.client = 'shree-heights';
++  document.body.appendChild(s);
++}
++
+ createRoot(document.getElementById('root')).render(
+   <StrictMode>
+     <RouterProvider router={router} />

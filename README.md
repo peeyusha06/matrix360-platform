@@ -30,7 +30,7 @@ Outside 9am to 8pm IST, Tanmayi's policy gate blocks WhatsApp sends, as it shoul
 | **Dashboard** | | http://127.0.0.1:8000/platform (admin key: `demo-admin-key`) |
 | Website chat | Avinash | http://127.0.0.1:8001/demo |
 | WhatsApp engage + policy gate | Tanmayi | http://127.0.0.1:4000 |
-| Landing site | Shalini | http://127.0.0.1:5173 (only if `../shree-heights-main` exists) |
+| Landing site, with Avinash's chat widget built in | Shalini + Avinash | http://127.0.0.1:5173 (only if `../shree-heights-main` exists) |
 
 Scripts:
 - `scripts/pratha_bridge.py`: exports leads in Pratha's sheet columns, imports her scored sheet back as `fit_score` and `fit_reasons`.

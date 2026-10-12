@@ -23,7 +23,7 @@ The shared DB stays the only lead database. Each tool keeps its own code and is 
 | Radar | None | `POST /api/v1/leads` |
 | Chat (Avinash) | None. Set `DB_API_URL`, `DB_API_KEY` | `/integrations/chat/leads/upsert`, `/integrations/chat/messages` |
 | WhatsApp (Tanmayi) | None. Set `SHARED_DB_URL`, `SHARED_DB_API_KEY`, `USE_DEV_DB_ADAPTER=false` | `/integrations/whatsapp/api/leads...` |
-| Landing site (Shalini) | One line: `FORM_ENDPOINT` reads `VITE_FORM_ENDPOINT` (`patches/shalini-form-endpoint.patch`) | `/integrations/landing/enquiry` |
+| Landing site (Shalini) | One line: `FORM_ENDPOINT` reads `VITE_FORM_ENDPOINT` (`patches/shalini-form-endpoint.patch`). Avinash's chat widget loads when `VITE_CHAT_WIDGET_URL` is set (`patches/shalini-chat-widget.patch`); without it the site runs as before. | `/integrations/landing/enquiry`; chat via Avinash's widget |
 | Qualifier (Pratha) | None | `scripts/pratha_bridge.py` exports her sheet format and imports scores with `PATCH` |
 | Reminders | New | `GET /api/v1/reminders/due` + Tanmayi's policy gate (`scripts/reminders.py`) |
 | Dashboard | New | `/platform` page in Mayur's app |
@@ -98,7 +98,7 @@ Bugs found and fixed while testing the real services together:
 - When the shared DB is unreachable, `sharedDbClient.js` quietly switches to mock data. In production that should fail loudly instead.
 
 **Shalini**
-- Apply `patches/shalini-form-endpoint.patch` (one line).
+- Apply `patches/shalini-form-endpoint.patch` (one line) and `patches/shalini-chat-widget.patch` (adds Avinash's widget, only when configured). Tested in a browser: a chat on the site reached the shared DB with `source: chat`, the page address and `utm google / widget_test`.
 - The page title says "from ₹70 Lakhs". Same unconfirmed price; check with the client.
 - Add a consent checkbox to the visit form if the team wants to follow up on WhatsApp after a form enquiry.
 

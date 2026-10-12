@@ -28,7 +28,7 @@ done
   nohup node server.js > $L/engage.log 2>&1 & echo $! > $L/engage.pid)
 
 if [ -d $S/site ]; then
-  (cd $S/site && VITE_FORM_ENDPOINT=$DB/integrations/landing/enquiry nohup npx vite --host 127.0.0.1 --port 5173 --strictPort \
+  (cd $S/site && VITE_FORM_ENDPOINT=$DB/integrations/landing/enquiry VITE_CHAT_WIDGET_URL=http://127.0.0.1:8001/widget.js nohup npx vite --host 127.0.0.1 --port 5173 --strictPort \
     > $L/site.log 2>&1 & echo $! > $L/site.pid)
 fi
 

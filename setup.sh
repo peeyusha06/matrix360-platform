@@ -28,6 +28,7 @@ rm -f $S/engage/.env   # never use a committed .env; start.sh sets the variables
 if [ -d ../shree-heights-main ]; then
   rm -rf $S/site && cp -R ../shree-heights-main $S/site && rm -rf $S/site/node_modules
   # One-line change so the form endpoint comes from the environment (see patches/).
+  (cd $S/site && patch -s -p1 < ../../patches/shalini-chat-widget.patch)   # adds Avinash's chat widget
   sed -i.bak "s|^export const FORM_ENDPOINT = '';|export const FORM_ENDPOINT = import.meta.env.VITE_FORM_ENDPOINT \|\| '';|" $S/site/src/data/site.js && rm $S/site/src/data/site.js.bak
 fi
 
