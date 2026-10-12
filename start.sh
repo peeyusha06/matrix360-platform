@@ -28,11 +28,13 @@ done
   nohup node server.js > $L/engage.log 2>&1 & echo $! > $L/engage.pid)
 
 if [ -d $S/site ]; then
-  (cd $S/site && VITE_FORM_ENDPOINT=$DB/integrations/landing/enquiry nohup npx vite --port 5173 --strictPort \
+  (cd $S/site && VITE_FORM_ENDPOINT=$DB/integrations/landing/enquiry nohup npx vite --host 127.0.0.1 --port 5173 --strictPort \
     > $L/site.log 2>&1 & echo $! > $L/site.pid)
 fi
 
-for url in $DB/health http://127.0.0.1:8001/health http://127.0.0.1:4000/api/health; do
+URLS="$DB/health http://127.0.0.1:8001/health http://127.0.0.1:4000/api/health"
+[ -d $S/site ] && URLS="$URLS http://127.0.0.1:5173/"
+for url in $URLS; do
   for i in $(seq 1 40); do curl -sf $url >/dev/null && break; sleep 0.5; done
   curl -sf $url >/dev/null && echo "up   $url" || echo "DOWN $url (see logs/)"
 done
