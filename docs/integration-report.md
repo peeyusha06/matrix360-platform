@@ -64,7 +64,7 @@ The shared DB stays the only lead database. Each tool keeps its own code and is 
 
 ## 4. Changes made
 
-Only Mayur's repo changed, on branch `integration/matrix360-platform`. All additive:
+Only Mayur's repo changed (shipped here as `patches/mayur-shared-db-integration.patch`). All additive:
 - `PATCH /api/v1/leads/{id}`, contact history, funnel, due reminders, `/platform` dashboard.
 - Adapters for chat, WhatsApp and landing forms.
 - Site-visit status now moves the lead stage.

@@ -1,5 +1,7 @@
 # Matrix360 Platform
 
+> **Handover (13 Oct 2026).** Built by Peeyusha on 12 Oct, handed to Avinash. Everything runs and the end-to-end test passes from a clean setup. Mayur's changes ship as `patches/mayur-shared-db-integration.patch` and are applied by `setup.sh`; once Mayur merges them into his repo, delete that patch line. Open items for each person are in section 6 of [docs/integration-report.md](docs/integration-report.md). Shalini's site is not on GitHub, so put her folder next to this one as `shree-heights-main` before running `setup.sh`.
+
 Runs the intern team's tools as one lead platform on one laptop, all writing to Mayur's shared lead database.
 
 ```
