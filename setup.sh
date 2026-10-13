@@ -17,7 +17,7 @@ if [ ! -d "$S/shared-db" ]; then
   git -C "$S/shared-db" -c user.name=setup -c user.email=setup@local am -q "$PWD/patches/mayur-shared-db-integration.patch"
 fi
 # Peeyusha: Demand Radar
-fetch radar peeyusha06/matrix360-demand-radar
+fetch radar AvinashWasHere21/matrix360-demand-radar  # moved from peeyusha06; the old URL redirects
 # Avinash, Tanmayi and Pratha publish their code as zip files.
 fetch _avinash AvinashWasHere21/interchangeable-chatbot
 fetch _tanmayi tanmayi1005/matrix
