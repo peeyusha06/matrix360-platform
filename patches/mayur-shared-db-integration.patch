@@ -1,0 +1,946 @@
+From 64f9c9c34cb6f5ea7dea098bf809e3531bceaa6c Mon Sep 17 00:00:00 2001
+From: Peeyusha Patki <212137116+peeyusha06@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 22:32:52 +0530
+Subject: [PATCH] Platform integration: connect chat, WhatsApp, landing pages
+ and scoring to the shared DB
+
+Additive changes only; all 29 existing tests still pass (42 total).
+
+- PATCH /api/v1/leads/{id} with audited changes
+- Contact history (contact_events) for the WhatsApp frequency cap and timeline
+- Funnel counts, due visit reminders, /platform dashboard
+- Adapters matching Avinash's DB_API_URL contract, Tanmayi's sharedDbClient
+  paths and Shalini's form payloads, so their code does not change
+- Site-visit status now moves the lead stage
+- Alembic migration c7d1a2b3e4f5 (additive, tested on an existing DB)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../c7d1a2b3e4f5_platform_integration.py      |  49 +++
+ app/config.py                                 |   6 +
+ app/main.py                                   |  15 +
+ app/models.py                                 |  28 ++
+ app/platform.py                               | 406 ++++++++++++++++++
+ app/static/platform.html                      |  97 +++++
+ docs/database.md                              |  30 ++
+ tests/test_platform.py                        | 190 ++++++++
+ 8 files changed, 821 insertions(+)
+ create mode 100644 alembic/versions/c7d1a2b3e4f5_platform_integration.py
+ create mode 100644 app/platform.py
+ create mode 100644 app/static/platform.html
+ create mode 100644 tests/test_platform.py
+
+diff --git a/alembic/versions/c7d1a2b3e4f5_platform_integration.py b/alembic/versions/c7d1a2b3e4f5_platform_integration.py
+new file mode 100644
+index 0000000..a03b18f
+--- /dev/null
++++ b/alembic/versions/c7d1a2b3e4f5_platform_integration.py
+@@ -0,0 +1,49 @@
++"""platform_integration: external_ref, details, contact_events
++
++Revision ID: c7d1a2b3e4f5
++Revises: b44e2fae97e3
++Create Date: 2026-10-12
++
++Additive only. Existing rows keep working: new lead columns are nullable,
++and contact_events is a new table. Nothing is dropped or rewritten.
++"""
++from typing import Sequence, Union
++
++from alembic import op
++import sqlalchemy as sa
++
++revision: str = "c7d1a2b3e4f5"
++down_revision: Union[str, Sequence[str], None] = "b44e2fae97e3"
++branch_labels: Union[str, Sequence[str], None] = None
++depends_on: Union[str, Sequence[str], None] = None
++
++
++def upgrade() -> None:
++    with op.batch_alter_table("leads", schema=None) as batch_op:
++        batch_op.add_column(sa.Column("external_ref", sa.String(120), nullable=True))
++        batch_op.add_column(sa.Column("details", sa.JSON(), nullable=True))
++        batch_op.create_index("ix_leads_external_ref", ["external_ref"], unique=True)
++
++    op.create_table(
++        "contact_events",
++        sa.Column("id", sa.Integer(), primary_key=True),
++        sa.Column("lead_id", sa.String(36), sa.ForeignKey("leads.id"), nullable=False),
++        sa.Column("channel", sa.String(20), nullable=False),
++        sa.Column("direction", sa.String(10), nullable=False),
++        sa.Column("status", sa.String(20), nullable=False, server_default="sent"),
++        sa.Column("message_id", sa.String(120), nullable=True),
++        sa.Column("text", sa.Text(), nullable=False, server_default=""),
++        sa.Column("occurred_at", sa.DateTime(timezone=True), nullable=False),
++    )
++    op.create_index("ix_contact_events_lead_id", "contact_events", ["lead_id"])
++    op.create_index("ix_contact_events_message_id", "contact_events", ["message_id"])
++
++
++def downgrade() -> None:
++    op.drop_index("ix_contact_events_message_id", table_name="contact_events")
++    op.drop_index("ix_contact_events_lead_id", table_name="contact_events")
++    op.drop_table("contact_events")
++    with op.batch_alter_table("leads", schema=None) as batch_op:
++        batch_op.drop_index("ix_leads_external_ref")
++        batch_op.drop_column("details")
++        batch_op.drop_column("external_ref")
+diff --git a/app/config.py b/app/config.py
+index aca993b..94ffd66 100644
+--- a/app/config.py
++++ b/app/config.py
+@@ -24,6 +24,12 @@ class Settings:
+ 
+     consent_notice_version: str = os.getenv("CONSENT_NOTICE_VERSION", "referralops-demo-v1")
+ 
++    # Matrix360 platform: shared key for tool-to-tool calls, and browser origins
++    # allowed to call the API (landing pages, chat widget, dashboard).
++    integration_api_key: str = os.getenv("INTEGRATION_API_KEY", "demo-integration-key")
++    allowed_origins: str = os.getenv(
++        "ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173,http://localhost:8001,http://127.0.0.1:8001")
++
+ 
+ def get_settings() -> Settings:
+     """Return a settings snapshot, useful for an app created in tests."""
+diff --git a/app/main.py b/app/main.py
+index d70213c..9efc448 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -28,6 +28,7 @@ from .schemas import (
+     ReferralCreate, SiteVisitCreate, SiteVisitUpdate, LeadCreate, LeadResponse,
+ )
+ from .scoring import calculate_score
++from .platform import register_platform
+ from .profiles import public_profiles, get_profile
+ 
+ STATIC_DIR = Path(__file__).parent / "static"
+@@ -145,6 +146,10 @@ def _lead_dict(lead: Lead) -> dict:
+         "utm_source": lead.utm_source,
+         "utm_campaign": lead.utm_campaign,
+ 
++        # Platform integration (additive)
++        "external_ref": lead.external_ref,
++        "details": lead.details or {},
++
+         # Legacy & detailed qualification fields (preserved for existing routes & dashboard)
+         "id": lead.id,
+         "primary_partner_id": lead.primary_partner_id,
+@@ -911,6 +916,14 @@ def create_app(
+         if payload.notes is not None:
+             visit.notes = (visit.notes + "\n" + payload.notes).strip()
+         visit.updated_at = utcnow()
++        # Keep the shared lead stage in step with the visit (Matrix360 platform).
++        lead = db.get(Lead, visit.lead_id)
++        if lead is not None:
++            lead.stage = {"scheduled": "visit_booked", "completed": "visit_completed",
++                          "cancelled": "visit_cancelled"}[payload.status]
++            lead.next_action = {"scheduled": "Send visit reminders", "completed": "Sales follow-up after visit",
++                                "cancelled": "Offer a new visit slot"}[payload.status]
++            lead.next_action_date = visit.scheduled_at if payload.status == "scheduled" else utcnow()
+         _record_audit(db, f"site_visit.{payload.status}", visit.lead_id, actor="admin",
+                       details={"visit_id": visit.id, "from_status": previous_status, "to_status": payload.status})
+         db.commit()
+@@ -1001,6 +1014,8 @@ def create_app(
+         events = db.scalars(select(AuditEvent).order_by(AuditEvent.created_at.desc()).limit(limit)).all()
+         return [_audit_dict(event) for event in events]
+ 
++    register_platform(app, get_db=get_db, require_admin=require_admin, settings=settings,
++                      create_lead=create_lead, lead_dict=_lead_dict, record_audit=_record_audit)
+     return app
+ 
+ 
+diff --git a/app/models.py b/app/models.py
+index 8888c4e..40d970b 100644
+--- a/app/models.py
++++ b/app/models.py
+@@ -202,6 +202,14 @@ class Lead(Base):
+         DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+     )
+ 
++    # Integration fields (Matrix360 platform). Additive and nullable.
++    # external_ref: another tool's own id for this lead, e.g. "chat:<id>",
++    # so repeated sends from that tool update one lead.
++    external_ref: Mapped[str | None] = mapped_column(String(120), nullable=True, unique=True, index=True)
++    # details: tool-specific data with no shared column (chat summary,
++    # open questions, landing-page form fields). Kept, never dropped.
++    details: Mapped[dict | None] = mapped_column(JSON, nullable=True)
++
+     # ------------------------------------------------------------------
+     # Computed property aliases for canonical field names
+     # ------------------------------------------------------------------
+@@ -335,3 +343,23 @@ class AuditEvent(Base):
+     created_at: Mapped[datetime] = mapped_column(
+         DateTime(timezone=True), default=utcnow, nullable=False
+     )
++
++
++# ---------------------------------------------------------------------------
++# ContactEvent: every message to or from a lead, on any channel
++# ---------------------------------------------------------------------------
++
++class ContactEvent(Base):
++    """One message or contact attempt. Feeds Tanmayi's frequency cap and the
++    lead timeline. Chat lines use status "chat" so they never count as an
++    outbound marketing contact."""
++    __tablename__ = "contact_events"
++
++    id: Mapped[int] = mapped_column(Integer, primary_key=True)
++    lead_id: Mapped[str] = mapped_column(ForeignKey("leads.id"), index=True, nullable=False)
++    channel: Mapped[str] = mapped_column(String(20), nullable=False)
++    direction: Mapped[str] = mapped_column(String(10), nullable=False)
++    status: Mapped[str] = mapped_column(String(20), default="sent", nullable=False)
++    message_id: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
++    text: Mapped[str] = mapped_column(Text, default="", nullable=False)
++    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+diff --git a/app/platform.py b/app/platform.py
+new file mode 100644
+index 0000000..24206a8
+--- /dev/null
++++ b/app/platform.py
+@@ -0,0 +1,406 @@
++"""Matrix360 platform integration: connects the team's tools to this shared DB.
++
++Adds, without changing any existing route:
++- PATCH /api/v1/leads/{id}, contact history, funnel counts, due reminders.
++- Adapters that speak each tool's existing format, so their code does not change:
++    /integrations/chat/...       Avinash's chat widget (DB_API_URL contract)
++    /integrations/whatsapp/...   Tanmayi's sharedDbClient (/api/leads...)
++    /integrations/landing/...    Shalini's landing-page forms (FORM_ENDPOINT)
++
++Every new lead still goes through the existing create_lead route logic, so
++dedupe (phone last 10 -> email -> LinkedIn), scoring and audit stay in one place.
++"""
++from __future__ import annotations
++
++import hashlib
++import hmac
++import threading
++from datetime import datetime, timedelta, timezone
++
++from fastapi import Depends, Header, HTTPException, Query, Request
++from fastapi.middleware.cors import CORSMiddleware
++from fastapi.responses import FileResponse
++from pathlib import Path
++from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
++from sqlalchemy import func, select
++
++from .models import ContactEvent, Lead, SiteVisit, utcnow
++from .schemas import VALID_STAGES, LeadCreate
++from .scoring import calculate_score
++
++STAGE_RANK = {"new": 0, "qualified": 1, "contacted": 2, "engaged": 3, "visit_booked": 4}
++PATCH_STAGES = VALID_STAGES | {"opted_out"}
++
++CHAT_CLIENTS = {"shree-heights": "Shree Heights", "lakhotia-industrial": "Lakhotia", "vrindavan-greens": "Vrindavan Greens"}
++CLIENT_PROPERTY = {"Shree Heights": "flats", "Lakhotia": "industrial", "Vrindavan Greens": "plots"}
++CHAT_PROPERTY = {"flat": "flats", "plot": "plots", "industrial": "industrial"}
++CHAT_TIMELINE = {"asap": "immediate", "1_3": "within_3_months", "3_6": "within_6_months", "6_plus": "within_12_months"}
++CHAT_ROLE = {"decision_maker": True, "helping": False, "researching": False}
++CHAT_STAGE = {"New": "new", "In conversation": "engaged", "Qualified": "engaged",
++              "Handoff requested": "engaged", "Visit booked": "visit_booked"}
++INDIVIDUAL = "Individual buyer"  # company is required by the lead model; buyers have none
++# ponytail: one lock per process; with several app processes on Postgres use SELECT ... FOR UPDATE instead.
++_CHAT_LOCK = threading.Lock()
++
++
++class LeadUpdate(BaseModel):
++    """Fields any tool may change on an existing lead. Each change is audited."""
++    model_config = ConfigDict(extra="forbid")
++
++    stage: str | None = None
++    intent: str | None = None
++    owner: str | None = Field(default=None, max_length=120)
++    next_action: str | None = Field(default=None, max_length=255)
++    next_action_date: datetime | None = None
++    fit_score: int | None = Field(default=None, ge=0, le=100)
++    fit_reasons: list[str] | None = None
++    consent: bool | None = None
++    opted_out: bool | None = None
++
++    @field_validator("stage")
++    @classmethod
++    def known_stage(cls, v):
++        if v is not None and v not in PATCH_STAGES:
++            raise ValueError(f"Unknown stage '{v}'")
++        return v
++
++    @field_validator("intent")
++    @classmethod
++    def known_intent(cls, v):
++        if v is not None and v not in {"hot", "warm", "cold"}:
++            raise ValueError("intent must be hot, warm or cold")
++        return v
++
++
++class ContactIn(BaseModel):
++    model_config = ConfigDict(extra="ignore")
++    channel: str = Field(default="whatsapp", max_length=20)
++    direction: str = Field(default="outbound", pattern="^(inbound|outbound)$")
++    status: str = Field(default="sent", max_length=20)
++    message_id: str | None = Field(default=None, max_length=120)
++    text: str = Field(default="", max_length=4000)
++    timestamp: datetime | None = None
++
++
++def _contact_dict(c: ContactEvent) -> dict:
++    return {"id": c.id, "lead_id": c.lead_id, "channel": c.channel, "direction": c.direction,
++            "status": c.status, "message_id": c.message_id, "text": c.text,
++            "timestamp": c.occurred_at.isoformat()}
++
++
++def _clean_contact(value):
++    """Forms send placeholders like 'Not known'. Only real-looking values count."""
++    if not value or not isinstance(value, str):
++        return None
++    return value.strip() if any(ch.isdigit() for ch in value) or "@" in value else None
++
++
++def _chat_structured(rec: dict) -> dict:
++    """Chat answers mapped to the fields the shared scoring rule reads."""
++    budget_lakh = rec.get("budget_max_lakh") or rec.get("budget_min_lakh")
++    return {
++        "timeline": CHAT_TIMELINE.get(rec.get("timeline"), "unknown"),
++        "budget_inr": float(budget_lakh) * 100_000 if budget_lakh else None,
++        "is_decision_maker": CHAT_ROLE.get(rec.get("role")),
++        "site_visit_interest": rec.get("consult_type") == "visit",
++    }
++
++
++def _known(value):
++    """Forms use placeholders for skipped answers; treat them as missing."""
++    if not isinstance(value, str) or value.strip().lower() in {"", "not known", "unknown", "not sure", "n/a"}:
++        return None
++    return value.strip()
++
++
++def register_platform(app, *, get_db, require_admin, settings, create_lead, lead_dict, record_audit):
++    origins = [o.strip() for o in settings.allowed_origins.split(",") if o.strip()]
++    app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["GET", "POST", "PATCH"],
++                       allow_headers=["Content-Type", "Authorization", "X-Admin-Key", "Idempotency-Key"])
++
++    def require_integration(authorization: str | None = Header(default=None)) -> None:
++        token = (authorization or "").removeprefix("Bearer ").strip()
++        if not token or not hmac.compare_digest(token, settings.integration_api_key):
++            raise HTTPException(status_code=401, detail="Valid 'Authorization: Bearer <INTEGRATION_API_KEY>' required")
++
++    def get_lead_or_404(db, lead_id: str) -> Lead:
++        lead = db.get(Lead, lead_id)
++        if not lead:
++            raise HTTPException(status_code=404, detail="Lead not found")
++        return lead
++
++    # ── shared operations ────────────────────────────────────────────────────
++
++    def update_lead(db, lead: Lead, upd: LeadUpdate, actor: str) -> dict:
++        data = upd.model_dump(exclude_unset=True)
++        before = lead_dict(lead)
++        column = {"fit_score": "score", "fit_reasons": "score_reasons"}
++        for key, value in data.items():
++            if key == "consent":
++                lead.consent_to_share = lead.contact_consent = bool(value)
++            else:
++                setattr(lead, column.get(key, key), value)
++        after = lead_dict(lead)
++        changes = {k: [before[k], after[k]] for k in data if before.get(k) != after.get(k)}
++        if changes:
++            lead.updated_at = utcnow()
++            record_audit(db, "lead.updated", lead.id, actor=actor, details={"changes": changes})
++        db.commit()
++        db.refresh(lead)
++        return lead_dict(lead)
++
++    def list_contacts(db, lead_id: str) -> list[dict]:
++        rows = db.scalars(select(ContactEvent).where(ContactEvent.lead_id == lead_id)
++                          .order_by(ContactEvent.occurred_at)).all()
++        return [_contact_dict(c) for c in rows]
++
++    def add_contact(db, lead_id: str, c: ContactIn, actor: str) -> dict:
++        if c.message_id:
++            existing = db.scalar(select(ContactEvent).where(ContactEvent.message_id == c.message_id))
++            if existing:
++                return _contact_dict(existing)  # retries are safe
++        event = ContactEvent(lead_id=lead_id, channel=c.channel, direction=c.direction, status=c.status,
++                             message_id=c.message_id, text=c.text, occurred_at=c.timestamp or utcnow())
++        db.add(event)
++        db.flush()
++        record_audit(db, f"contact.{c.direction}", lead_id, actor=actor,
++                     details={"channel": c.channel, "status": c.status, "message_id": c.message_id})
++        db.commit()
++        return _contact_dict(event)
++
++    def save_new(db, payload: LeadCreate, details_key: str, details: dict, external_ref: str | None = None):
++        """Create through the existing endpoint logic, then attach tool details."""
++        result = create_lead(payload=payload, db=db, idempotency_key=None)
++        lead = db.get(Lead, result["lead_id"])
++        merged = dict(lead.details or {})
++        merged[details_key] = details
++        lead.details = merged
++        if external_ref and lead.external_ref is None:
++            lead.external_ref = external_ref
++        elif external_ref and lead.external_ref != external_ref:
++            record_audit(db, "lead.external_ref_conflict", lead.id, actor=payload.source,
++                         details={"existing": lead.external_ref, "incoming": external_ref})
++        db.commit()
++        db.refresh(lead)
++        return lead, result["is_duplicate"]
++
++    # ── canonical API additions (admin key) ──────────────────────────────────
++
++    @app.get("/platform", include_in_schema=False)
++    def platform_dashboard():
++        return FileResponse(Path(__file__).parent / "static" / "platform.html")
++
++    @app.patch("/api/v1/leads/{lead_id}", tags=["leads"], dependencies=[Depends(require_admin)])
++    def patch_lead(lead_id: str, payload: LeadUpdate, db=Depends(get_db), x_actor: str | None = Header(default=None)):
++        return update_lead(db, get_lead_or_404(db, lead_id), payload, actor=x_actor or "api")
++
++    @app.get("/api/v1/leads/{lead_id}/contacts", tags=["contacts"], dependencies=[Depends(require_admin)])
++    def get_contacts(lead_id: str, db=Depends(get_db)):
++        get_lead_or_404(db, lead_id)
++        return list_contacts(db, lead_id)
++
++    @app.post("/api/v1/leads/{lead_id}/contacts", status_code=201, tags=["contacts"], dependencies=[Depends(require_admin)])
++    def post_contact(lead_id: str, payload: ContactIn, db=Depends(get_db)):
++        get_lead_or_404(db, lead_id)
++        return add_contact(db, lead_id, payload, actor="api")
++
++    @app.get("/api/v1/funnel", tags=["reporting"], dependencies=[Depends(require_admin)])
++    def funnel(db=Depends(get_db)):
++        def counts(col):
++            return {k or "unknown": n for k, n in db.execute(select(col, func.count()).group_by(col)).all()}
++        stage = counts(Lead.stage)
++        return {
++            "stages": {s: stage.get(s, 0) for s in STAGE_RANK} | {k: v for k, v in stage.items() if k not in STAGE_RANK},
++            "by_source": counts(Lead.source),
++            "by_intent": counts(Lead.intent),
++            "opted_out": db.scalar(select(func.count()).select_from(Lead).where(Lead.opted_out.is_(True))) or 0,
++            "total": db.scalar(select(func.count()).select_from(Lead)) or 0,
++        }
++
++    @app.get("/api/v1/reminders/due", tags=["site visits"], dependencies=[Depends(require_admin)])
++    def reminders_due(now: datetime | None = Query(default=None), db=Depends(get_db)):
++        """Site-visit reminders that are due and not yet recorded as sent.
++        The caller sends each one through Tanmayi's policy gate, then records it with
++        POST /contacts using the returned message_id, so it is never sent twice."""
++        now = now or datetime.now(timezone.utc)
++        if now.tzinfo is None:
++            now = now.replace(tzinfo=timezone.utc)
++        due = []
++        visits = db.scalars(select(SiteVisit).where(SiteVisit.status == "scheduled", SiteVisit.scheduled_at.is_not(None))).all()
++        for v in visits:
++            at = v.scheduled_at if v.scheduled_at.tzinfo else v.scheduled_at.replace(tzinfo=timezone.utc)
++            if not now < at:
++                continue
++            kind = "2h" if now >= at - timedelta(hours=2) else "24h" if now >= at - timedelta(hours=24) else None
++            if not kind:
++                continue
++            message_id = f"reminder-{kind}:{v.id}"
++            if db.scalar(select(ContactEvent).where(ContactEvent.message_id == message_id)):
++                continue
++            due.append({"visit_id": v.id, "kind": kind, "scheduled_at": at.isoformat(),
++                        "message_id": message_id, "lead": lead_dict(db.get(Lead, v.lead_id))})
++        return due
++
++    # ── Tanmayi: WhatsApp engage (sharedDbClient paths, Bearer key) ───────────
++
++    wa = "/integrations/whatsapp/api/leads"
++
++    @app.get(wa, tags=["integrations"], dependencies=[Depends(require_integration)])
++    def wa_list(db=Depends(get_db)):
++        return [lead_dict(l) for l in db.scalars(select(Lead).order_by(Lead.created_at.desc()).limit(500)).all()]
++
++    @app.get(wa + "/{lead_id}", tags=["integrations"], dependencies=[Depends(require_integration)])
++    def wa_get(lead_id: str, db=Depends(get_db)):
++        return lead_dict(get_lead_or_404(db, lead_id))
++
++    @app.patch(wa + "/{lead_id}", tags=["integrations"], dependencies=[Depends(require_integration)])
++    def wa_patch(lead_id: str, payload: LeadUpdate, db=Depends(get_db)):
++        return update_lead(db, get_lead_or_404(db, lead_id), payload, actor="whatsapp_engage")
++
++    @app.get(wa + "/{lead_id}/contacts", tags=["integrations"], dependencies=[Depends(require_integration)])
++    def wa_contacts(lead_id: str, db=Depends(get_db)):
++        get_lead_or_404(db, lead_id)
++        return list_contacts(db, lead_id)
++
++    @app.post(wa + "/{lead_id}/contacts", status_code=201, tags=["integrations"], dependencies=[Depends(require_integration)])
++    def wa_add_contact(lead_id: str, payload: ContactIn, db=Depends(get_db)):
++        get_lead_or_404(db, lead_id)
++        return add_contact(db, lead_id, payload, actor="whatsapp_engage")
++
++    # ── Avinash: website chat (DB_API_URL contract, Bearer key) ──────────────
++
++    @app.post("/integrations/chat/leads/upsert", tags=["integrations"], dependencies=[Depends(require_integration)])
++    def chat_upsert(rec: dict, db=Depends(get_db)):
++        # The chat sends overlapping updates from two threads; apply them one at a time.
++        with _CHAT_LOCK:
++            db.expire_all()
++            return _chat_upsert(rec, db)
++
++    def _chat_upsert(rec: dict, db):
++        chat_id = str(rec.get("lead_id") or "").strip()
++        client = CHAT_CLIENTS.get(rec.get("client_id"))
++        if not chat_id or not client:
++            raise HTTPException(status_code=422, detail="lead_id and a known client_id are required")
++        ref = f"chat:{chat_id}"
++        structured = _chat_structured(rec)
++        chat_details = {k: v for k, v in rec.items() if k not in {"name", "phone", "email"}}
++        lead = db.scalar(select(Lead).where(Lead.external_ref == ref))
++        duplicate = False
++        if lead is None:
++            phone, email = _clean_contact(rec.get("phone")), _clean_contact(rec.get("email"))
++            if not (phone or email):
++                return {"status": "waiting_for_contact_details", "external_ref": ref}
++            try:
++                payload = LeadCreate(
++                    client=client, property_type=CHAT_PROPERTY.get(rec.get("property_type")) or CLIENT_PROPERTY[client],
++                    lead_type="buyer", source="chat", evidence=rec.get("page_url") or "Website chat",
++                    name=rec.get("name") or "Website visitor", company=INDIVIDUAL, phone=phone, email=email,
++                    consent=rec.get("followup_consent") is True,
++                    utm_source=rec.get("utm_source") or None, utm_campaign=rec.get("utm_campaign") or None,
++                    business_requirements=(rec.get("summary") or "")[:1000], **structured,
++                )
++            except ValidationError as exc:
++                raise HTTPException(status_code=422, detail=exc.errors(include_url=False)) from exc
++            lead, duplicate = save_new(db, payload, "chat", chat_details, external_ref=ref)
++            if lead.external_ref != ref:
++                # Matched an existing lead already linked to a different chat. Do not merge.
++                return {"lead_id": lead.id, "is_duplicate": True, "status": "needs_review", "lead": lead_dict(lead)}
++
++        # Each chat turn refreshes the lead with what the buyer has said so far.
++        # The chat can deliver an older record after a newer one; keep the newest.
++        stored = (lead.details or {}).get("chat") or {}
++        if stored.get("lead_id") == chat_id and str(rec.get("updated_at") or "") < str(stored.get("updated_at") or ""):
++            return {"lead_id": lead.id, "external_ref": ref, "is_duplicate": duplicate, "status": "older_update_ignored",
++                    "lead": lead_dict(lead)}
++        if stored.get("lead_id") == chat_id and str(rec.get("updated_at") or "") == str(stored.get("updated_at") or ""):
++            # Same-second records arrive in any order. Answers only fill in during a chat,
++            # so merge: a blank value never wipes one already received.
++            chat_details = {**stored, **{k: v for k, v in chat_details.items() if v not in (None, "", [])}}
++            rec = {**stored, **{k: v for k, v in rec.items() if v not in (None, "", [])}}
++            structured = _chat_structured(rec)
++        before = lead_dict(lead)
++        lead.details = {**(lead.details or {}), "chat": chat_details}
++        for key, value in structured.items():
++            if value not in (None, "unknown", False):
++                setattr(lead, key, value)
++        if rec.get("followup_consent") is True:
++            lead.consent_to_share = lead.contact_consent = True
++        elif rec.get("followup_consent") is False:
++            lead.consent_to_share = lead.contact_consent = False
++        score = calculate_score({"industry": lead.industry, "plot_size_sqm": lead.plot_size_sqm,
++                                 "budget_inr": lead.budget_inr, "timeline": lead.timeline,
++                                 "is_decision_maker": lead.is_decision_maker,
++                                 "site_visit_interest": lead.site_visit_interest},
++                                profile_id=lead.property_type or "industrial")
++        lead.score, lead.score_reasons, lead.missing_fields, lead.intent = score.score, score.reasons, score.missing_fields, score.intent
++        target = CHAT_STAGE.get(rec.get("stage"), "engaged")
++        if STAGE_RANK.get(target, 0) > STAGE_RANK.get(lead.stage or "new", 0):
++            lead.stage = target
++        if rec.get("handoff_requested"):
++            lead.next_action = f"Sales to call: {rec.get('handoff_reason') or 'buyer asked for a person'}"[:255]
++            lead.next_action_date = utcnow()
++        after = lead_dict(lead)
++        changes = {k: [before[k], after[k]] for k in ("intent", "stage", "consent", "fit_score", "next_action") if before[k] != after[k]}
++        if changes:
++            record_audit(db, "lead.chat_synced", lead.id, actor="chat", details={"changes": changes, "external_ref": ref})
++        lead.updated_at = utcnow()
++        db.commit()
++        db.refresh(lead)
++        return {"lead_id": lead.id, "external_ref": ref, "is_duplicate": duplicate, "lead": lead_dict(lead)}
++
++    @app.post("/integrations/chat/messages", status_code=201, tags=["integrations"], dependencies=[Depends(require_integration)])
++    def chat_message(rec: dict, db=Depends(get_db)):
++        lead = db.scalar(select(Lead).where(Lead.external_ref == f"chat:{rec.get('lead_id')}"))
++        if lead is None:
++            raise HTTPException(status_code=404, detail="Send the lead upsert first")  # chat retries in order
++        role = rec.get("role")
++        msg = ContactIn(channel="chat", direction="inbound" if role == "lead" else "outbound",
++                        status="chat",  # never counts toward the WhatsApp frequency cap
++                        # retries resend the identical line; different lines in the same second must both be kept
++                        message_id="chat:" + hashlib.sha1(f"{rec.get('lead_id')}|{rec.get('ts')}|{role}|{rec.get('text')}".encode()).hexdigest()[:24],
++                        text=str(rec.get("text") or "")[:4000], timestamp=rec.get("ts"))
++        return add_contact(db, lead.id, msg, actor="chat")
++
++    # ── Shalini: landing-page forms (public, CORS-limited) ───────────────────
++
++    @app.post("/integrations/landing/enquiry", status_code=201, tags=["integrations"])
++    async def landing_enquiry(request: Request, db=Depends(get_db)):
++        body = await request.json()
++        attr = body.get("attribution") or {}
++        client = body.get("client") if body.get("client") in CLIENT_PROPERTY else "Shree Heights"
++        common = dict(client=client, property_type=CLIENT_PROPERTY[client],
++                      utm_source=attr.get("utm_source"), utm_campaign=attr.get("utm_campaign"))
++        details = {k: v for k, v in body.items() if k not in {"name", "phone", "email"}}
++        try:
++            if body.get("kind") == "referral":
++                partner, prospect = body.get("partner") or {}, body.get("lead")
++                if prospect:
++                    # Consent was asserted by the partner for this enquiry only: keep it
++                    # false here so no channel messages the prospect until a person confirms.
++                    payload = LeadCreate(
++                        **common, lead_type="buyer", source="referral",
++                        evidence=prospect.get("evidence") or prospect.get("referralId") or f"Referred by {partner.get('name')}",
++                        name=prospect.get("name") or "Referred prospect",
++                        company=_known(prospect.get("company")) or INDIVIDUAL,
++                        phone=_clean_contact(prospect.get("phone")), email=_clean_contact(prospect.get("email")),
++                        consent=False, next_action="Confirm the prospect's consent before any message",
++                        business_requirements=(prospect.get("reason") or "")[:1000])
++                else:
++                    payload = LeadCreate(
++                        **common, lead_type="broker", source="broker", evidence="Partner registration form",
++                        name=partner.get("name") or "Partner", company=partner.get("firm") or "Independent partner",
++                        phone=_clean_contact(partner.get("phone")), email=_clean_contact(partner.get("email")),
++                        linkedin_url=partner.get("linkedin") or None, consent=False)
++            else:
++                payload = LeadCreate(
++                    **common, lead_type="buyer", source="landing_page",
++                    evidence=attr.get("landing") or body.get("from") or "Landing page",
++                    name=body.get("name") or "Website visitor", company=INDIVIDUAL,
++                    phone=_clean_contact(body.get("phone")), email=_clean_contact(body.get("email")),
++                    consent=body.get("consent") is True,  # the form has no consent box yet
++                    site_visit_interest=body.get("kind") == "visit",
++                    business_requirements=(body.get("summary") or body.get("message") or "")[:1000])
++        except ValidationError as exc:
++            raise HTTPException(status_code=422, detail=exc.errors(include_url=False)) from exc
++        lead, duplicate = save_new(db, payload, "landing", details)
++        return {"lead_id": lead.id, "is_duplicate": duplicate, "lead": lead_dict(lead)}
+diff --git a/app/static/platform.html b/app/static/platform.html
+new file mode 100644
+index 0000000..2deb5d7
+--- /dev/null
++++ b/app/static/platform.html
+@@ -0,0 +1,97 @@
++<!doctype html>
++<html lang="en">
++<head>
++<meta charset="utf-8">
++<meta name="viewport" content="width=device-width, initial-scale=1">
++<title>Matrix360 Leads</title>
++<style>
++  :root { --bg:#f5f7f8; --card:#fff; --ink:#15212b; --muted:#5a6a76; --line:#dde3e7; --accent:#0e6a86;
++          --hot:#a3392d; --warm:#9a6400; --cold:#36577a; --ok:#1f7a4d; }
++  @media (prefers-color-scheme: dark) { :root { --bg:#0f161c; --card:#16212a; --ink:#e6edf1; --muted:#9aabb6; --line:#2a3843;
++          --accent:#5fb8d3; --hot:#ef8a7c; --warm:#e7b558; --cold:#8fb3d9; --ok:#6fcf9b; } }
++  * { box-sizing: border-box; }
++  body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
++  main { max-width:1200px; margin:0 auto; padding:24px 16px; display:grid; gap:20px; }
++  h1 { margin:0; font-size:1.6rem; } h2 { margin:0 0 8px; font-size:1.05rem; }
++  .bar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
++  input, select, button { font:inherit; padding:6px 10px; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--ink); }
++  button { cursor:pointer; border-color:var(--accent); color:var(--accent); }
++  .funnel { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:8px; }
++  .tile { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:10px 12px; }
++  .tile b { display:block; font-size:1.4rem; font-variant-numeric:tabular-nums; }
++  .tile span { color:var(--muted); font-size:.8rem; text-transform:uppercase; letter-spacing:.05em; }
++  .wrap { overflow-x:auto; background:var(--card); border:1px solid var(--line); border-radius:8px; }
++  table { border-collapse:collapse; width:100%; min-width:900px; }
++  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
++  th { font-size:.75rem; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
++  tr.row { cursor:pointer; } tr.row:hover td { background:color-mix(in srgb, var(--accent) 7%, transparent); }
++  .pill { font-size:.75rem; font-weight:600; padding:1px 8px; border-radius:999px; border:1px solid currentColor; white-space:nowrap; }
++  .hot { color:var(--hot); } .warm { color:var(--warm); } .cold { color:var(--cold); } .yes { color:var(--ok); }
++  .muted { color:var(--muted); }
++  #detail { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:16px; display:grid; gap:12px; }
++  #detail ul { margin:0; padding-left:18px; } .err { color:var(--hot); }
++</style>
++</head>
++<body>
++<main>
++  <div class="bar" style="justify-content:space-between">
++    <h1>Matrix360 Leads</h1>
++    <div class="bar">
++      <label for="key" class="muted">Admin key</label>
++      <input id="key" type="password" autocomplete="off">
++      <select id="client"><option value="">All clients</option><option>Lakhotia</option><option>Shree Heights</option><option>Vrindavan Greens</option></select>
++      <button id="load" type="button">Load</button>
++    </div>
++  </div>
++  <p id="msg" class="muted">Enter the admin key and press Load. One list for every tool: Radar, landing pages, chat, WhatsApp, referrals.</p>
++  <section><h2>Funnel</h2><div id="funnel" class="funnel"></div></section>
++  <section class="wrap"><table>
++    <thead><tr><th>Lead</th><th>Client</th><th>Source</th><th>Stage</th><th>Intent</th><th>Fit</th><th>Consent</th><th>Next action</th><th>Updated</th></tr></thead>
++    <tbody id="rows"></tbody></table></section>
++  <section id="detail" hidden></section>
++</main>
++<script>
++const $ = (id) => document.getElementById(id);
++const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
++try { $("key").value = sessionStorage.getItem("m360key") || ""; } catch {}
++async function api(path) {
++  const r = await fetch(path, { headers: { "X-Admin-Key": $("key").value } });
++  if (!r.ok) throw new Error(r.status === 401 ? "Wrong admin key." : `Error ${r.status}`);
++  return r.json();
++}
++async function load() {
++  try { sessionStorage.setItem("m360key", $("key").value); } catch {}
++  try {
++    const q = $("client").value ? `&client=${encodeURIComponent($("client").value)}` : "";
++    const [funnel, leads] = await Promise.all([api("/api/v1/funnel"), api(`/api/v1/leads?limit=500${q}`)]);
++    $("msg").textContent = `${leads.length} lead(s). Click a row for its full history.`;
++    $("msg").className = "muted";
++    const tiles = { ...funnel.stages, total: funnel.total };
++    $("funnel").innerHTML = Object.entries(tiles).map(([k, v]) => `<div class="tile"><b>${v}</b><span>${esc(k.replace("_", " "))}</span></div>`).join("");
++    $("rows").innerHTML = leads.map((l) => `<tr class="row" data-id="${esc(l.lead_id)}">
++      <td><b>${esc(l.company !== "Individual buyer" ? l.company : l.name)}</b><br><span class="muted">${esc(l.name)} · ${esc(l.phone || "")}</span></td>
++      <td>${esc(l.client)}</td><td>${esc(l.source)}</td><td>${esc(l.stage)}</td>
++      <td><span class="pill ${esc(l.intent)}">${esc(l.intent)}</span></td><td>${l.fit_score}</td>
++      <td>${l.opted_out ? '<span class="pill hot">opted out</span>' : l.consent ? '<span class="pill yes">yes</span>' : '<span class="muted">no</span>'}</td>
++      <td>${esc(l.next_action || "")}</td><td class="muted">${esc((l.updated_at || "").slice(0, 16).replace("T", " "))}</td></tr>`).join("");
++    document.querySelectorAll("tr.row").forEach((tr) => tr.addEventListener("click", () => show(tr.dataset.id)));
++  } catch (e) { $("msg").textContent = e.message; $("msg").className = "err"; }
++}
++async function show(id) {
++  const [l, contacts] = await Promise.all([api(`/api/v1/leads/${id}`), api(`/api/v1/leads/${id}/contacts`)]);
++  const d = $("detail"); d.hidden = false;
++  d.innerHTML = `<h2>${esc(l.company !== "Individual buyer" ? l.company : l.name)} · ${esc(l.client)}</h2>
++    <div class="muted">Source: ${esc(l.source)} · Evidence: ${esc(l.evidence)} · UTM: ${esc(l.utm_source || "-")} / ${esc(l.utm_campaign || "-")}</div>
++    <div><b>Fit ${l.fit_score}/100</b><ul>${(l.fit_reasons || []).map((r) => `<li>${esc(r)}</li>`).join("")}</ul></div>
++    ${l.details && l.details.chat ? `<div><b>Chat summary</b><p>${esc(l.details.chat.summary || "")}</p>
++      ${(l.details.chat.open_questions || []).length ? `<p class="warm">Needs a person to answer: ${esc(l.details.chat.open_questions.join("; "))}</p>` : ""}</div>` : ""}
++    <div><b>Messages</b><ul>${contacts.map((c) => `<li>${esc(c.timestamp.slice(0, 16).replace("T", " "))} · ${esc(c.channel)} ${esc(c.direction)} · ${esc(c.status)} ${c.text ? "· " + esc(c.text.slice(0, 140)) : ""}</li>`).join("") || "<li class='muted'>None yet</li>"}</ul></div>
++    <div><b>Site visits</b><ul>${(l.site_visits || []).map((v) => `<li>${esc(v.status)} ${esc(v.scheduled_at || "")}</li>`).join("") || "<li class='muted'>None</li>"}</ul></div>
++    <div><b>Audit trail</b><ul>${(l.audit_history || []).map((e) => `<li>${esc(e.created_at.slice(0, 16).replace("T", " "))} · ${esc(e.event_type)} · ${esc(e.actor)}</li>`).join("")}</ul></div>`;
++  d.scrollIntoView({ behavior: "smooth" });
++}
++$("load").addEventListener("click", load);
++$("key").addEventListener("keydown", (e) => { if (e.key === "Enter") load(); });
++</script>
++</body>
++</html>
+diff --git a/docs/database.md b/docs/database.md
+index 3c722d3..098505c 100644
+--- a/docs/database.md
++++ b/docs/database.md
+@@ -209,3 +209,33 @@ In `demo` mode (`AI_PROVIDER=demo`), the system runs deterministically without a
+    ```powershell
+    Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/v1/leads" -Headers @{"X-Admin-Key"="demo-admin-key"}
+    ```
++
++---
++
++## 8. Platform integration (added for the one-platform build)
++
++Additive only: no existing route, field or test changed behaviour. Migration `c7d1a2b3e4f5` adds `leads.external_ref`, `leads.details` and a `contact_events` table.
++
++### New canonical endpoints (X-Admin-Key)
++
++| Endpoint | Purpose |
++|---|---|
++| `PATCH /api/v1/leads/{lead_id}` | Update `stage`, `intent`, `owner`, `next_action`, `next_action_date`, `fit_score`, `fit_reasons`, `consent`, `opted_out`. Each change is written to the audit trail. Optional `X-Actor` header names the tool. |
++| `GET/POST /api/v1/leads/{lead_id}/contacts` | Message history on any channel (`channel`, `direction`, `status`, `message_id`, `text`, `timestamp`). A repeated `message_id` is stored once. |
++| `GET /api/v1/funnel` | Counts by stage, source and intent, plus opted-out total. |
++| `GET /api/v1/reminders/due` | Scheduled site visits needing a 24-hour or 2-hour reminder that has not been recorded yet. |
++| `GET /platform` | One dashboard for every tool's leads, with history and audit trail. |
++
++Scheduling, completing or cancelling a site visit now also moves the lead's `stage` (`visit_booked`, `visit_completed`, `visit_cancelled`).
++
++### Adapters (so other tools work without code changes)
++
++All use `Authorization: Bearer <INTEGRATION_API_KEY>` except the public landing form.
++
++| Tool | Point the tool at | Mapping |
++|---|---|---|
++| Avinash's chat (`DB_API_URL`) | `http://<host>/integrations/chat` | `/leads/upsert` creates or updates one lead per conversation (`external_ref = chat:<id>`), matched to existing leads by the 3-step dedupe. `client_id`, `property_type`, timeline, budget (lakh to INR) and role are mapped; intent comes from the shared hot/warm/cold rule; chat-only fields are kept in `details.chat`. Older or same-second records never wipe newer answers. `/messages` stores chat lines with `status: "chat"` so they never count toward the WhatsApp frequency cap. |
++| Tanmayi's engage (`SHARED_DB_URL`) | `http://<host>/integrations/whatsapp` | Same paths her `sharedDbClient.js` already calls: `/api/leads`, `/api/leads/{id}` (GET, PATCH), `/api/leads/{id}/contacts`. |
++| Shalini's landing forms (`FORM_ENDPOINT`) | `http://<host>/integrations/landing/enquiry` | Site-visit and enquiry forms become `source: landing_page` with UTM fields. Referral forms become a `referral` buyer lead (consent kept false until a person confirms) or a `broker` lead for partner sign-ups. Browser origins are limited by `ALLOWED_ORIGINS`. |
++
++New settings: `INTEGRATION_API_KEY` (default `demo-integration-key`) and `ALLOWED_ORIGINS`. Change both, and `ADMIN_API_KEY`, before running anywhere public.
+diff --git a/tests/test_platform.py b/tests/test_platform.py
+new file mode 100644
+index 0000000..a71a622
+--- /dev/null
++++ b/tests/test_platform.py
+@@ -0,0 +1,190 @@
++"""Matrix360 platform integration: PATCH, contacts, adapters, reminders, funnel."""
++from datetime import datetime, timedelta, timezone
++
++import pytest
++from fastapi.testclient import TestClient
++
++from app.config import Settings
++from app.main import create_app
++
++ADMIN = {"X-Admin-Key": "test-secret"}
++TOOL = {"Authorization": "Bearer tool-secret"}
++
++
++@pytest.fixture
++def client(tmp_path):
++    settings = Settings(database_url=f"sqlite:///{(tmp_path / 'p.db').as_posix()}", admin_api_key="test-secret",
++                        ai_provider="demo", integration_api_key="tool-secret")
++    return TestClient(create_app(settings=settings))
++
++
++def make_lead(client, **over):
++    body = {"client": "Shree Heights", "property_type": "flats", "lead_type": "buyer", "source": "landing_page",
++            "name": "Test Buyer", "company": "Individual buyer", "phone": "+91 9000011111", "consent": True}
++    body.update(over)
++    r = client.post("/api/v1/leads", json=body)
++    assert r.status_code == 201, r.text
++    return r.json()["lead_id"]
++
++
++def chat_record(**over):
++    rec = {"lead_id": "chat-1", "client_id": "shree-heights", "name": "Asha Roy", "phone": "+919000022222",
++           "property_type": "flat", "timeline": "1_3", "budget_max_lakh": 80, "role": "researching",
++           "consult_type": None, "followup_consent": None, "stage": "In conversation", "score": "Warm",
++           "summary": "2 BHK, about 80 lakh", "open_questions": ["parking charges?"], "utm_source": "instagram"}
++    rec.update(over)
++    return rec
++
++
++def test_patch_updates_fields_and_audits(client):
++    lead_id = make_lead(client)
++    r = client.patch(f"/api/v1/leads/{lead_id}", headers=ADMIN,
++                     json={"stage": "qualified", "fit_score": 72, "fit_reasons": ["Pratha rubric"], "owner": "Pratha"})
++    assert r.status_code == 200
++    lead = r.json()
++    assert (lead["stage"], lead["fit_score"], lead["fit_reasons"], lead["owner"]) == ("qualified", 72, ["Pratha rubric"], "Pratha")
++    audit = client.get("/api/v1/audit", headers=ADMIN).json()
++    assert any(e["event_type"] == "lead.updated" and "fit_score" in e["details"]["changes"] for e in audit)
++
++
++def test_patch_rejects_unknown_values_and_needs_admin(client):
++    lead_id = make_lead(client)
++    assert client.patch(f"/api/v1/leads/{lead_id}", json={"stage": "qualified"}).status_code == 401
++    assert client.patch(f"/api/v1/leads/{lead_id}", headers=ADMIN, json={"stage": "won_big"}).status_code == 422
++    assert client.patch(f"/api/v1/leads/{lead_id}", headers=ADMIN, json={"lead_type": "x"}).status_code == 422
++
++
++def test_contacts_are_recorded_once_per_message_id(client):
++    lead_id = make_lead(client)
++    msg = {"channel": "whatsapp", "direction": "outbound", "status": "sent", "message_id": "wamid.1"}
++    assert client.post(f"/api/v1/leads/{lead_id}/contacts", headers=ADMIN, json=msg).status_code == 201
++    client.post(f"/api/v1/leads/{lead_id}/contacts", headers=ADMIN, json=msg)  # retry
++    assert len(client.get(f"/api/v1/leads/{lead_id}/contacts", headers=ADMIN).json()) == 1
++
++
++def test_whatsapp_adapter_matches_tanmayi_client(client):
++    lead_id = make_lead(client)
++    base = "/integrations/whatsapp/api/leads"
++    assert client.get(base).status_code == 401
++    leads = client.get(base, headers=TOOL).json()
++    assert isinstance(leads, list) and leads[0]["lead_id"] == lead_id
++    # what engageWorkflow sends on STOP
++    r = client.patch(f"{base}/{lead_id}", headers=TOOL, json={"opted_out": True, "stage": "opted_out", "intent": "cold",
++                                                              "next_action": "none_opted_out", "next_action_date": None})
++    assert r.status_code == 200 and r.json()["opted_out"] is True and r.json()["stage"] == "opted_out"
++    client.post(f"{base}/{lead_id}/contacts", headers=TOOL,
++                json={"timestamp": "2026-10-12T10:00:00Z", "direction": "outbound", "status": "sent",
++                      "channel": "whatsapp", "message_id": "m1"})
++    history = client.get(f"{base}/{lead_id}/contacts", headers=TOOL).json()
++    assert history[0]["direction"] == "outbound" and history[0]["status"] == "sent"
++
++
++def test_chat_upsert_creates_then_updates_one_lead(client):
++    first = client.post("/integrations/chat/leads/upsert", headers=TOOL, json=chat_record()).json()
++    lead = first["lead"]
++    assert (lead["client"], lead["property_type"], lead["source"], lead["lead_type"]) == ("Shree Heights", "flats", "chat", "buyer")
++    assert lead["intent"] == "warm" and lead["stage"] == "engaged" and lead["consent"] is False
++    assert lead["details"]["chat"]["open_questions"] == ["parking charges?"]
++    again = client.post("/integrations/chat/leads/upsert", headers=TOOL,
++                        json=chat_record(consult_type="visit", followup_consent=True, stage="Visit booked")).json()
++    assert again["lead_id"] == first["lead_id"]
++    assert again["lead"]["intent"] == "hot" and again["lead"]["consent"] is True and again["lead"]["stage"] == "visit_booked"
++    # stage never moves backwards
++    back = client.post("/integrations/chat/leads/upsert", headers=TOOL, json=chat_record(stage="In conversation")).json()
++    assert back["lead"]["stage"] == "visit_booked"
++    assert len(client.get("/api/v1/leads", headers=ADMIN).json()) == 1
++
++
++def test_chat_matches_existing_lead_by_phone_and_keeps_source(client):
++    lead_id = make_lead(client, phone="9000022222", utm_source="facebook")
++    r = client.post("/integrations/chat/leads/upsert", headers=TOOL, json=chat_record()).json()
++    assert r["lead_id"] == lead_id and r["is_duplicate"] is True
++    assert r["lead"]["source"] == "landing_page" and r["lead"]["utm_source"] == "facebook"
++    assert len(client.get("/api/v1/leads", headers=ADMIN).json()) == 1
++
++
++def test_chat_messages_do_not_count_as_whatsapp_contacts(client):
++    lead_id = client.post("/integrations/chat/leads/upsert", headers=TOOL, json=chat_record()).json()["lead_id"]
++    msg = {"lead_id": "chat-1", "client_id": "shree-heights", "role": "bot", "text": "Hi Asha", "ts": "2026-10-12T10:00:00Z"}
++    assert client.post("/integrations/chat/messages", headers=TOOL, json=msg).status_code == 201
++    client.post("/integrations/chat/messages", headers=TOOL, json=msg)  # retry
++    history = client.get(f"/api/v1/leads/{lead_id}/contacts", headers=ADMIN).json()
++    assert len(history) == 1 and history[0]["status"] == "chat" and history[0]["channel"] == "chat"
++    client.post("/integrations/chat/messages", headers=TOOL, json=dict(msg, text="What size?"))  # same second, new line
++    assert len(client.get(f"/api/v1/leads/{lead_id}/contacts", headers=ADMIN).json()) == 2
++    unknown = dict(msg, lead_id="chat-unknown")
++    assert client.post("/integrations/chat/messages", headers=TOOL, json=unknown).status_code == 404
++
++
++def test_landing_forms_map_to_shared_format(client):
++    visit = {"kind": "visit", "name": "Ravi Sen", "phone": "9000033333", "email": "", "date": "2026-10-17",
++             "slot": "Morning", "config": "3 BHK", "attribution": {"landing": "/", "utm_source": "instagram",
++                                                                   "utm_campaign": "sh_oct"}, "summary": "3 BHK visit"}
++    lead = client.post("/integrations/landing/enquiry", json=visit).json()["lead"]
++    assert (lead["source"], lead["utm_source"], lead["utm_campaign"], lead["consent"]) == ("landing_page", "instagram", "sh_oct", False)
++    assert lead["intent"] == "hot" and lead["details"]["landing"]["slot"] == "Morning"
++
++    referral = {"kind": "referral", "intent": "lead",
++                "partner": {"name": "Broker One", "firm": "B1 Realty", "phone": "9000044444", "email": ""},
++                "lead": {"name": "Prospect P", "company": "Unknown", "phone": "9000055555", "email": "Unknown",
++                         "reason": "Moving to Chandannagar", "consent": {"given": True}}}
++    lead = client.post("/integrations/landing/enquiry", json=referral).json()["lead"]
++    assert (lead["source"], lead["consent"], lead["company"]) == ("referral", False, "Individual buyer")
++    assert "consent" in lead["next_action"].lower()
++
++    partner = {"kind": "referral", "intent": "register", "lead": None,
++               "partner": {"name": "Broker Two", "firm": "B2 Homes", "phone": "9000066666", "email": "b2@homes.test"}}
++    lead = client.post("/integrations/landing/enquiry", json=partner).json()["lead"]
++    assert (lead["lead_type"], lead["source"], lead["company"]) == ("broker", "broker", "B2 Homes")
++
++
++def test_visit_schedule_moves_stage_and_reminders_are_due_once(client):
++    lead_id = make_lead(client)
++    visit = client.post(f"/api/v1/leads/{lead_id}/site-visits", headers=ADMIN, json={"requested_by": "chat"}).json()
++    at = datetime.now(timezone.utc) + timedelta(hours=20)
++    r = client.patch(f"/api/v1/site-visits/{visit['id']}", headers=ADMIN,
++                     json={"status": "scheduled", "scheduled_at": at.isoformat()})
++    assert r.status_code == 200
++    assert client.get(f"/api/v1/leads/{lead_id}", headers=ADMIN).json()["stage"] == "visit_booked"
++
++    due = client.get("/api/v1/reminders/due", headers=ADMIN).json()
++    assert [d["kind"] for d in due] == ["24h"]
++    client.post(f"/api/v1/leads/{lead_id}/contacts", headers=ADMIN,
++                json={"channel": "whatsapp", "status": "sent", "message_id": due[0]["message_id"]})
++    assert client.get("/api/v1/reminders/due", headers=ADMIN).json() == []
++    two_hours_before = (at - timedelta(minutes=90)).isoformat()
++    assert [d["kind"] for d in client.get("/api/v1/reminders/due", headers=ADMIN, params={"now": two_hours_before}).json()] == ["2h"]
++
++    client.patch(f"/api/v1/site-visits/{visit['id']}", headers=ADMIN, json={"status": "cancelled"})
++    assert client.get(f"/api/v1/leads/{lead_id}", headers=ADMIN).json()["stage"] == "visit_cancelled"
++    assert client.get("/api/v1/reminders/due", headers=ADMIN).json() == []
++
++
++def test_funnel_counts(client):
++    make_lead(client)
++    client.post("/integrations/chat/leads/upsert", headers=TOOL, json=chat_record())
++    f = client.get("/api/v1/funnel", headers=ADMIN).json()
++    assert f["total"] == 2 and f["stages"]["new"] == 1 and f["stages"]["engaged"] == 1
++    assert f["by_source"] == {"landing_page": 1, "chat": 1}
++
++
++def test_chat_ignores_an_older_record_delivered_late(client):
++    newer = chat_record(updated_at="2026-10-12T10:05:00", followup_consent=True)
++    older = chat_record(updated_at="2026-10-12T10:01:00", followup_consent=None)
++    client.post("/integrations/chat/leads/upsert", headers=TOOL, json=newer)
++    r = client.post("/integrations/chat/leads/upsert", headers=TOOL, json=older).json()
++    assert r["status"] == "older_update_ignored" and r["lead"]["consent"] is True
++
++
++def test_platform_dashboard_page_is_served(client):
++    r = client.get("/platform")
++    assert r.status_code == 200 and "Matrix360 Leads" in r.text
++
++
++def test_chat_same_second_records_merge_instead_of_wiping(client):
++    full = chat_record(updated_at="2026-10-12T10:05:00", followup_consent=True, visit_pref="Sat 17 Oct, Morning")
++    partial = chat_record(updated_at="2026-10-12T10:05:00", followup_consent=None, visit_pref=None)
++    client.post("/integrations/chat/leads/upsert", headers=TOOL, json=full)
++    lead = client.post("/integrations/chat/leads/upsert", headers=TOOL, json=partial).json()["lead"]
++    assert lead["consent"] is True and lead["details"]["chat"]["visit_pref"] == "Sat 17 Oct, Morning"
++    assert lead["details"]["chat"]["followup_consent"] is True
+-- 
+2.54.0 (Apple Git-157)
+

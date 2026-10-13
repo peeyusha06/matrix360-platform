@@ -11,8 +11,11 @@ fetch() {  # fetch <dir> <repo> [branch]
   git clone -q --depth 1 ${3:+-b "$3"} "https://github.com/$2.git" "$S/$1"
 }
 
-# Mayur: shared DB. Uses the integration branch until it is merged into main.
-fetch shared-db "${MAYUR_REPO:-peeyusha06/referralops_demo}" "${MAYUR_BRANCH:-integration/matrix360-platform}"
+# Mayur: shared DB, plus the platform integration as a patch until Mayur merges it.
+if [ ! -d "$S/shared-db" ]; then
+  git clone -q https://github.com/Mayur-Techs/referralops_demo.git "$S/shared-db"
+  git -C "$S/shared-db" -c user.name=setup -c user.email=setup@local am -q "$PWD/patches/mayur-shared-db-integration.patch"
+fi
 # Peeyusha: Demand Radar
 fetch radar peeyusha06/matrix360-demand-radar
 # Avinash, Tanmayi and Pratha publish their code as zip files.
